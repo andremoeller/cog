@@ -129,7 +129,7 @@ class Runner(ABC):
                 log.error("caught exception while running job", exc_info=True)
                 self._shutdown_event.set()
 
-        self._response = event_handler.response
+        self._response = event_handler.job
         self._result = self._threadpool.apply_async(
             func=work,
             kwds={
@@ -177,7 +177,9 @@ class Runner(ABC):
 def create_event_handler(
     request: schema.JobRequest, upload_url: Optional[str] = None
 ) -> "JobEventHandler":
-    response = schema.JobResponse(**request.dict())
+    if isinstance(request, schema.PredictionRequest):
+        response = schema.PredictionResponse(**request.dict())
+    # response = schema.JobResponse(**request.dict())
 
     webhook = request.webhook
     events_filter = (
@@ -230,11 +232,12 @@ class JobEventHandler:
         else:
             raise ValueError(f"Response {response} has invalid type: {type(response)}")
         log.info(f"starting {self._runnable_name}")
-        self.response = response
-        self.response.status = schema.Status.PROCESSING
-        self.response.output = None
-        self.response.logs = ""
-        self.response.started_at = datetime.now(tz=timezone.utc)
+
+        self.job = response
+        self.job.status = schema.Status.PROCESSING
+        self.job.output = None
+        self.job.logs = ""
+        self.job.started_at = datetime.now(tz=timezone.utc)
 
         self._webhook_sender = webhook_sender
         self._file_uploader = file_uploader
@@ -243,63 +246,63 @@ class JobEventHandler:
 
     @property
     def response(self) -> schema.JobResponse:
-        return self.response
+        return self.job
 
     def set_output(self, output: Any) -> None:
         assert (
-            self.response.output is None
+            self.job.output is None
         ), f"{self._runnable_class_name} unexpectedly returned multiple outputs"
-        self.response.output = self._upload_files(output)
+        self.job.output = self._upload_files(output)
         # We don't send a webhook for compatibility with the behaviour of
         # redis_queue. In future we can consider whether it makes sense to send
         # one here.
 
     def append_output(self, output: Any) -> None:
         assert isinstance(
-            self.response.output, list
+            self.job.output, list
         ), "Cannot append output before setting output"
-        self.response.output.append(self._upload_files(output))
+        self.job.output.append(self._upload_files(output))
         self._send_webhook(schema.WebhookEvent.OUTPUT)
 
     def append_logs(self, logs: str) -> None:
-        assert self.response.logs is not None
-        self.response.logs += logs
+        assert self.job.logs is not None
+        self.job.logs += logs
         self._send_webhook(schema.WebhookEvent.LOGS)
 
     def succeeded(self) -> None:
         log.info(f"{self._runnable_name} succeeded")
-        self.response.status = schema.Status.SUCCEEDED
+        self.job.status = schema.Status.SUCCEEDED
         self._set_completed_at()
         # These have been set already: this is to convince the typechecker of
         # that...
-        assert self.response.completed_at is not None
-        assert self.response.started_at is not None
-        self.response.metrics = {
+        assert self.job.completed_at is not None
+        assert self.job.started_at is not None
+        self.job.metrics = {
             f"{self._time_metric_name}": (
-                self.response.completed_at - self.response.started_at
+                self.job.completed_at - self.job.started_at
             ).total_seconds()
         }
         self._send_webhook(schema.WebhookEvent.COMPLETED)
 
     def failed(self, error: str) -> None:
         log.info(f"{self._runnable_name} failed", error=error)
-        self.response.status = schema.Status.FAILED
-        self.response.error = error
+        self.job.status = schema.Status.FAILED
+        self.job.error = error
         self._set_completed_at()
         self._send_webhook(schema.WebhookEvent.COMPLETED)
 
     def canceled(self) -> None:
         log.info(f"{self._runnable_name} canceled")
-        self.response.status = schema.Status.CANCELED
+        self.job.status = schema.Status.CANCELED
         self._set_completed_at()
         self._send_webhook(schema.WebhookEvent.COMPLETED)
 
     def _set_completed_at(self) -> None:
-        self.response.completed_at = datetime.now(tz=timezone.utc)
+        self.job.completed_at = datetime.now(tz=timezone.utc)
 
     def _send_webhook(self, event: schema.WebhookEvent) -> None:
         if self._webhook_sender is not None:
-            dict_response = jsonable_encoder(self.response.dict(exclude_unset=True))
+            dict_response = jsonable_encoder(self.job.dict(exclude_unset=True))
             self._webhook_sender(dict_response, event)
 
     def _upload_files(self, output: Any) -> Any:
@@ -370,6 +373,7 @@ def work(
 ) -> schema.JobResponse:
     # Set up logger context within prediction thread.
     structlog.contextvars.clear_contextvars()
+    print(type(request))
     logger_context_key = get_logger_context_key(request)
     structlog.contextvars.bind_contextvars(**{logger_context_key: request.id})
 
@@ -408,7 +412,7 @@ def _work(
                 event_handler.append_logs(tb)
                 event_handler.failed(error=str(e))
                 log.warn("failed to download url path from input", exc_info=True)
-                return event_handler.response
+                return event_handler.job
 
     for event in worker.run(input_dict, poll=0.1):
         if should_cancel.is_set():
@@ -455,7 +459,7 @@ def _work(
         else:
             log.warn("received unexpected event from worker", data=event)
 
-    return event_handler.response
+    return event_handler.job
 
 
 def _make_file_upload_http_client() -> requests.Session:

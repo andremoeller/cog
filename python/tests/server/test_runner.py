@@ -1,7 +1,6 @@
 import os
 import pytest
 import threading
-import time
 from datetime import datetime
 from unittest import mock
 
@@ -10,15 +9,15 @@ from cog.server.eventtypes import (
     Done,
     Heartbeat,
     Log,
-    PredictionOutput,
-    PredictionOutputType,
+    JobOutput,
+    JobOutputType,
 )
 from cog.server.runner import (
-    PredictionEventHandler,
-    PredictionRunner,
+    JobEventHandler,
+    Runner,
     RunnerBusyError,
     UnknownPredictionError,
-    predict,
+    work,
 )
 
 
@@ -29,9 +28,7 @@ def _fixture_path(name):
 
 @pytest.fixture
 def runner():
-    runner = PredictionRunner(
-        predictor_ref=_fixture_path("sleep"), shutdown_event=threading.Event()
-    )
+    runner = Runner(job_ref=_fixture_path("sleep"), shutdown_event=threading.Event())
     try:
         runner.setup().get(5)
         yield runner
@@ -40,9 +37,7 @@ def runner():
 
 
 def test_prediction_runner_setup():
-    runner = PredictionRunner(
-        predictor_ref=_fixture_path("sleep"), shutdown_event=threading.Event()
-    )
+    runner = Runner(job_ref=_fixture_path("sleep"), shutdown_event=threading.Event())
     try:
         result = runner.setup().get(5)
 
@@ -56,7 +51,7 @@ def test_prediction_runner_setup():
 
 def test_prediction_runner(runner):
     request = PredictionRequest(input={"sleep": 0.1})
-    _, async_result = runner.predict(request)
+    _, async_result = runner.run(request)
     response = async_result.get(timeout=1)
     assert response.output == "done in 0.1 seconds"
     assert response.status == "succeeded"
@@ -68,11 +63,11 @@ def test_prediction_runner(runner):
 
 def test_prediction_runner_called_while_busy(runner):
     request = PredictionRequest(input={"sleep": 0.1})
-    _, async_result = runner.predict(request)
+    _, async_result = runner.run(request)
 
     assert runner.is_busy()
     with pytest.raises(RunnerBusyError):
-        runner.predict(request)
+        runner.run(request)
 
     # Call .get() to ensure that the first prediction is scheduled before we
     # attempt to shut down the runner.
@@ -82,9 +77,9 @@ def test_prediction_runner_called_while_busy(runner):
 def test_prediction_runner_called_while_busy_idempotent(runner):
     request = PredictionRequest(id="abcd1234", input={"sleep": 0.1})
 
-    runner.predict(request)
-    runner.predict(request)
-    _, async_result = runner.predict(request)
+    runner.run(request)
+    runner.run(request)
+    _, async_result = runner.run(request)
 
     response = async_result.get(timeout=1)
     assert response.id == "abcd1234"
@@ -96,9 +91,9 @@ def test_prediction_runner_called_while_busy_idempotent_wrong_id(runner):
     request1 = PredictionRequest(id="abcd1234", input={"sleep": 0.1})
     request2 = PredictionRequest(id="5678efgh", input={"sleep": 0.1})
 
-    _, async_result = runner.predict(request1)
+    _, async_result = runner.run(request1)
     with pytest.raises(RunnerBusyError):
-        runner.predict(request2)
+        runner.run(request2)
 
     response = async_result.get(timeout=1)
     assert response.id == "abcd1234"
@@ -108,7 +103,7 @@ def test_prediction_runner_called_while_busy_idempotent_wrong_id(runner):
 
 def test_prediction_runner_cancel(runner):
     request = PredictionRequest(input={"sleep": 0.5})
-    _, async_result = runner.predict(request)
+    _, async_result = runner.run(request)
 
     runner.cancel()
 
@@ -123,9 +118,9 @@ def test_prediction_runner_cancel(runner):
 
 def test_prediction_runner_cancel_matching_id(runner):
     request = PredictionRequest(id="abcd1234", input={"sleep": 0.5})
-    _, async_result = runner.predict(request)
+    _, async_result = runner.run(request)
 
-    runner.cancel(prediction_id="abcd1234")
+    runner.cancel(id="abcd1234")
 
     response = async_result.get(timeout=1)
     assert response.output == None
@@ -134,10 +129,10 @@ def test_prediction_runner_cancel_matching_id(runner):
 
 def test_prediction_runner_cancel_by_mismatched_id(runner):
     request = PredictionRequest(id="abcd1234", input={"sleep": 0.5})
-    _, async_result = runner.predict(request)
+    _, async_result = runner.run(request)
 
     with pytest.raises(UnknownPredictionError):
-        runner.cancel(prediction_id="5678efgh")
+        runner.cancel(id="5678efgh")
 
     response = async_result.get(timeout=1)
     assert response.output == "done in 0.5 seconds"
@@ -152,14 +147,14 @@ PREDICT_TESTS = [
     ([Done(error=True, error_detail="foo")], [mock.call.failed(error="foo")]),
     ([Log(source="stdout", message="help")], [mock.call.append_logs("help")]),
     (
-        [PredictionOutputType(multi=False), PredictionOutput(payload="hello world")],
+        [JobOutputType(multi=False), JobOutput(payload="hello world")],
         [mock.call.set_output("hello world")],
     ),
     (
         [
-            PredictionOutputType(multi=True),
-            PredictionOutput(payload="hello"),
-            PredictionOutput(payload="world"),
+            JobOutputType(multi=True),
+            JobOutput(payload="hello"),
+            JobOutput(payload="world"),
         ],
         [
             mock.call.set_output([]),
@@ -169,22 +164,22 @@ PREDICT_TESTS = [
     ),
     (
         [
-            PredictionOutputType(multi=False),
-            PredictionOutputType(multi=False),
-            PredictionOutput(payload="hello world"),
+            JobOutputType(multi=False),
+            JobOutputType(multi=False),
+            JobOutput(payload="hello world"),
         ],
-        [mock.call.failed(error="Predictor returned unexpected output")],
+        [mock.call.failed(error="Unexpected output returned")],
     ),
     (
-        [PredictionOutput(payload="hello world"), Done()],
-        [mock.call.failed(error="Predictor returned unexpected output")],
+        [JobOutput(payload="hello world"), Done()],
+        [mock.call.failed(error="Unexpected output returned")],
     ),
 ]
 
 
 def fake_worker(events):
     class FakeWorker:
-        def predict(self, input_, poll=None):
+        def run(self, input_, poll=None):
             for e in events:
                 yield e
 
@@ -198,7 +193,7 @@ def test_predict(events, calls):
     event_handler = mock.Mock()
     should_cancel = threading.Event()
 
-    response = predict(
+    response = work(
         worker=worker,
         request=request,
         event_handler=event_handler,
@@ -210,7 +205,7 @@ def test_predict(events, calls):
 
 def test_prediction_event_handler():
     p = PredictionResponse(input={"hello": "there"})
-    h = PredictionEventHandler(p)
+    h = JobEventHandler(p)
 
     assert p.status == Status.PROCESSING
     assert p.output is None
@@ -248,7 +243,7 @@ def test_prediction_event_handler():
 def test_prediction_event_handler_webhook_sender(match):
     s = mock.Mock()
     p = PredictionResponse(input={"hello": "there"})
-    h = PredictionEventHandler(p, webhook_sender=s)
+    h = JobEventHandler(p, webhook_sender=s)
 
     h.set_output([])
     h.append_output("elephant")
@@ -277,7 +272,7 @@ def test_prediction_event_handler_webhook_sender(match):
 def test_prediction_event_handler_webhook_sender_intermediate(match):
     s = mock.Mock()
     p = PredictionResponse(input={"hello": "there"})
-    h = PredictionEventHandler(p, webhook_sender=s)
+    h = JobEventHandler(p, webhook_sender=s)
 
     s.assert_called_once_with(match({"status": "processing"}), WebhookEvent.START)
 
@@ -354,7 +349,7 @@ def test_prediction_event_handler_webhook_sender_intermediate(match):
 def test_prediction_event_handler_file_uploads():
     u = mock.Mock()
     p = PredictionResponse(input={"hello": "there"})
-    h = PredictionEventHandler(p, file_uploader=u)
+    h = JobEventHandler(p, file_uploader=u)
 
     # in reality this would be a Path object, but in this test we just care it
     # passes the output into the upload files function and uses whatever comes

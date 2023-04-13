@@ -30,7 +30,7 @@ from ..predictor import (
     load_config,
     load_runnable_from_ref,
 )
-from .runner import Runner, RunnerBusyError, UnknownPredictionError
+from .runner import JobType, Runner, RunnerBusyError, UnknownPredictionError
 
 log = structlog.get_logger("cog.server.http")
 
@@ -150,9 +150,7 @@ def create_app(
             # For now, we only ask the Runner to handle file uploads for
             # async predictions. This is unfortunate but required to ensure
             # backwards-compatible behaviour for synchronous predictions.
-            initial_response, async_result = runner.predict(
-                request, upload=respond_async
-            )
+            initial_response, async_result = runner.run(request, upload=respond_async)
         except RunnerBusyError:
             return JSONResponse(
                 {"detail": "Already running a prediction"}, status_code=409
@@ -194,7 +192,7 @@ def create_app(
         # TODO: spec-compliant parsing of Prefer header.
         respond_async = prefer == "respond-async"
 
-        return _predict(request=request)
+        return _predict(request=request, respond_async=respond_async)
 
     @app.put(
         "/predictions/{prediction_id}",
@@ -230,11 +228,6 @@ def create_app(
 
         return _predict(request=request, respond_async=respond_async)
 
-    def _execute(
-        *, request: schema.JobRequest, respond_async: bool = False
-    ) -> Response:
-        pass
-
     def _predict(
         *, request: PredictionRequest, respond_async: bool = False
     ) -> Response:
@@ -252,9 +245,7 @@ def create_app(
             # For now, we only ask the Runner to handle file uploads for
             # async predictions. This is unfortunate but required to ensure
             # backwards-compatible behaviour for synchronous predictions.
-            initial_response, async_result = runner.predict(
-                request, upload=respond_async
-            )
+            initial_response, async_result = runner.run(request, upload=respond_async)
         except RunnerBusyError:
             return JSONResponse(
                 {"detail": "Already running a prediction"}, status_code=409
@@ -287,7 +278,7 @@ def create_app(
         if not runner.is_busy():
             return JSONResponse({}, status_code=404)
         try:
-            runner.cancel(prediction_id)
+            runner.cancel(prediction_id, JobType.PREDICTION)
         except UnknownPredictionError:
             return JSONResponse({}, status_code=404)
         else:

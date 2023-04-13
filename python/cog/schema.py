@@ -83,17 +83,17 @@ class JobResponse(JobBaseModel):
         )
 
 
-class TrainingRequest(JobBaseModel):
+class TrainingRequest(JobRequest):
     pass
 
 
-class TrainingResponse(JobBaseModel):
+class TrainingResponse(JobResponse):
     pass
 
 
-class PredictionRequest(JobBaseModel):
+class PredictionRequest(JobRequest):
     pass
 
 
-class PredictionResponse(JobBaseModel):
+class PredictionResponse(JobResponse):
     pass

@@ -20,8 +20,8 @@ from cog.server.eventtypes import (
     Done,
     Heartbeat,
     Log,
-    PredictionOutput,
-    PredictionOutputType,
+    JobOutput,
+    JobOutputType,
 )
 from cog.server.exceptions import FatalWorkerException, InvalidStateException
 from cog.server.worker import Worker
@@ -95,7 +95,7 @@ class Result:
     stdout: str = ""
     stderr: str = ""
     heartbeat_count: int = 0
-    output_type: Optional[PredictionOutputType] = None
+    output_type: Optional[JobOutputType] = None
     output: Any = None
     done: Optional[Done] = None
     exception: Optional[Exception] = None
@@ -120,7 +120,7 @@ def _process(events, swallow_exceptions=False):
             elif isinstance(event, Done):
                 assert not result.done
                 result.done = event
-            elif isinstance(event, PredictionOutput):
+            elif isinstance(event, JobOutput):
                 assert result.output_type, "Should get output type before any output"
                 if result.output_type.multi:
                     result.output.append(event.payload)
@@ -129,7 +129,7 @@ def _process(events, swallow_exceptions=False):
                         result.output is None
                     ), "Should not get multiple outputs for output type single"
                     result.output = event.payload
-            elif isinstance(event, PredictionOutputType):
+            elif isinstance(event, JobOutputType):
                 assert (
                     result.output_type is None
                 ), "Should not get multiple output type events"
@@ -157,7 +157,7 @@ def test_fatalworkerexception_from_setup_failures(name, payloads):
     """
     Any failure during setup is fatal and should raise FatalWorkerException.
     """
-    w = Worker(predictor_ref=_fixture_path(name), tee_output=False)
+    w = Worker(job_ref=_fixture_path(name), tee_output=False)
 
     with pytest.raises(FatalWorkerException):
         _process(w.setup())
@@ -172,7 +172,7 @@ def test_fatalworkerexception_from_irrecoverable_failures(data, name, payloads):
     Certain kinds of failure during predict (crashes, unexpected exits) are
     irrecoverable and should raise FatalWorkerException.
     """
-    w = Worker(predictor_ref=_fixture_path(name), tee_output=False)
+    w = Worker(job_ref=_fixture_path(name), tee_output=False)
 
     result = _process(w.setup())
     assert not result.done.error
@@ -180,7 +180,7 @@ def test_fatalworkerexception_from_irrecoverable_failures(data, name, payloads):
     with pytest.raises(FatalWorkerException):
         for _ in range(5):
             payload = data.draw(st.fixed_dictionaries(payloads))
-            _process(w.predict(payload))
+            _process(w.run(payload))
 
     w.terminate()
 
@@ -192,7 +192,7 @@ def test_no_exceptions_from_recoverable_failures(data, name, payloads):
     Well-behaved predictors, or those that only throw exceptions, should not
     raise.
     """
-    w = Worker(predictor_ref=_fixture_path(name), tee_output=False)
+    w = Worker(job_ref=_fixture_path(name), tee_output=False)
 
     try:
         result = _process(w.setup())
@@ -200,7 +200,7 @@ def test_no_exceptions_from_recoverable_failures(data, name, payloads):
 
         for _ in range(5):
             payload = data.draw(st.fixed_dictionaries(payloads))
-            _process(w.predict(payload))
+            _process(w.run(payload))
     finally:
         w.terminate()
 
@@ -213,7 +213,7 @@ def test_output(data, name, payloads, output_generator):
 
     Note that most of the validation work here is actually done in _process.
     """
-    w = Worker(predictor_ref=_fixture_path(name), tee_output=False)
+    w = Worker(job_ref=_fixture_path(name), tee_output=False)
 
     try:
         result = _process(w.setup())
@@ -222,7 +222,7 @@ def test_output(data, name, payloads, output_generator):
         payload = data.draw(st.fixed_dictionaries(payloads))
         expected_output = output_generator(payload)
 
-        result = _process(w.predict(payload))
+        result = _process(w.run(payload))
 
         assert result.output == expected_output
     finally:
@@ -235,7 +235,7 @@ def test_setup_logging(name, expected_stdout, expected_stderr):
     We should get the logs we expect from predictors that generate logs during
     setup.
     """
-    w = Worker(predictor_ref=_fixture_path(name), tee_output=False)
+    w = Worker(job_ref=_fixture_path(name), tee_output=False)
 
     try:
         result = _process(w.setup())
@@ -255,13 +255,13 @@ def test_predict_logging(name, payloads, expected_stdout, expected_stderr):
     We should get the logs we expect from predictors that generate logs during
     predict.
     """
-    w = Worker(predictor_ref=_fixture_path(name), tee_output=False)
+    w = Worker(job_ref=_fixture_path(name), tee_output=False)
 
     try:
         result = _process(w.setup())
         assert not result.done.error
 
-        result = _process(w.predict({}))
+        result = _process(w.run({}))
 
         assert result.stdout == expected_stdout
         assert result.stderr == expected_stderr
@@ -275,7 +275,7 @@ def test_cancel_is_safe():
     happening or the cancelation of unexpected predictions.
     """
 
-    w = Worker(predictor_ref=_fixture_path("sleep"), tee_output=True)
+    w = Worker(job_ref=_fixture_path("sleep"), tee_output=True)
 
     try:
         for _ in range(50):
@@ -286,12 +286,12 @@ def test_cancel_is_safe():
         for _ in range(50):
             w.cancel()
 
-        result1 = _process(w.predict({"sleep": 0.5}), swallow_exceptions=True)
+        result1 = _process(w.run({"sleep": 0.5}), swallow_exceptions=True)
 
         for _ in range(50):
             w.cancel()
 
-        result2 = _process(w.predict({"sleep": 0.1}), swallow_exceptions=True)
+        result2 = _process(w.run({"sleep": 0.1}), swallow_exceptions=True)
 
         assert not result1.exception
         assert not result1.done.canceled
@@ -308,14 +308,14 @@ def test_cancel_idempotency():
     recommended, should still only result in a single cancelled prediction, and
     should not affect subsequent predictions.
     """
-    w = Worker(predictor_ref=_fixture_path("sleep"), tee_output=True)
+    w = Worker(job_ref=_fixture_path("sleep"), tee_output=True)
 
     try:
         _process(w.setup())
 
         p1_done = None
 
-        for event in w.predict({"sleep": 0.5}, poll=0.01):
+        for event in w.run({"sleep": 0.5}, poll=0.01):
             # We call cancel a WHOLE BUNCH to make sure that we don't propagate
             # any of those cancelations to subsequent predictions, regardless
             # of the internal implementation of exceptions raised inside signal
@@ -328,7 +328,7 @@ def test_cancel_idempotency():
 
         assert p1_done.canceled
 
-        result2 = _process(w.predict({"sleep": 0.1}))
+        result2 = _process(w.run({"sleep": 0.1}))
 
         assert not result2.done.canceled
         assert result2.output == "done in 0.1 seconds"
@@ -343,7 +343,7 @@ def test_cancel_multiple_predictions():
     reset every time a prediction starts.
     """
 
-    w = Worker(predictor_ref=_fixture_path("sleep"), tee_output=True)
+    w = Worker(job_ref=_fixture_path("sleep"), tee_output=True)
 
     try:
         _process(w.setup())
@@ -353,7 +353,7 @@ def test_cancel_multiple_predictions():
         for _ in range(5):
             canceled = False
 
-            for event in w.predict({"sleep": 0.5}, poll=0.01):
+            for event in w.run({"sleep": 0.5}, poll=0.01):
                 if not canceled:
                     w.cancel()
                     canceled = True
@@ -373,12 +373,12 @@ def test_heartbeats():
     heartbeat events which allow the caller to do other stuff while waiting on
     completion.
     """
-    w = Worker(predictor_ref=_fixture_path("sleep"), tee_output=False)
+    w = Worker(job_ref=_fixture_path("sleep"), tee_output=False)
 
     try:
         _process(w.setup())
 
-        result = _process(w.predict({"sleep": 0.5}, poll=0.1))
+        result = _process(w.run({"sleep": 0.5}, poll=0.1))
 
         assert result.heartbeat_count > 0
     finally:
@@ -390,7 +390,7 @@ def test_heartbeats_cancel():
     Heartbeats should happen even when we cancel the prediction.
     """
 
-    w = Worker(predictor_ref=_fixture_path("sleep"), tee_output=False)
+    w = Worker(job_ref=_fixture_path("sleep"), tee_output=False)
 
     try:
         _process(w.setup())
@@ -399,7 +399,7 @@ def test_heartbeats_cancel():
         heartbeat_count = 0
         start = time.time()
 
-        for event in w.predict({"sleep": 10}, poll=0.1):
+        for event in w.run({"sleep": 10}, poll=0.1):
             if isinstance(event, Heartbeat):
                 heartbeat_count += 1
             if time.time() - start > 0.5:
@@ -420,12 +420,12 @@ def test_graceful_shutdown():
     then exit.
     """
 
-    w = Worker(predictor_ref=_fixture_path("sleep"), tee_output=False)
+    w = Worker(job_ref=_fixture_path("sleep"), tee_output=False)
 
     try:
         _process(w.setup())
 
-        events = w.predict({"sleep": 1}, poll=0.1)
+        events = w.run({"sleep": 1}, poll=0.1)
 
         # get one event to make sure we've started the prediction
         assert isinstance(next(events), Heartbeat)
@@ -500,7 +500,7 @@ class WorkerState(RuleBasedStateMachine):
     def predict(self, name, steps):
         try:
             payload = {"name": name, "steps": steps}
-            self.predict_generator = self.worker.predict(payload)
+            self.predict_generator = self.worker.run(payload)
             self.predict_payload = payload
             self.predict_events = []
         except InvalidStateException:
