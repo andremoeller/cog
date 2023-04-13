@@ -242,6 +242,8 @@ class _ChildWorker(_spawn.Process):  # type: ignore
 
     def _signal_handler(self, signum: int, frame: Optional[types.FrameType]) -> None:
         if signum == signal.SIGUSR1 and self._cancelable:
+            if hasattr(self._runnable, "cancel"):
+                self._runnable.cancel()
             raise CancelationException()
 
     def _stream_write_hook(

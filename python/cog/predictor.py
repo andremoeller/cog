@@ -203,7 +203,7 @@ def get_run_method(runnable: Runnable):
 def get_input_type(runnable: Runnable) -> Type[BaseInput]:
     """
     Creates a Pydantic Input model from the arguments of a Predictor's predict() method
-    or of a Trainer's train() method. Forexample,
+    or of a Trainer's train() method. For example,
 
     class Predictor(BasePredictor):
         def predict(self, text: str):
@@ -215,8 +215,8 @@ def get_input_type(runnable: Runnable) -> Type[BaseInput]:
         text: str
     """
 
-    predict = get_run_method(runnable)
-    signature = inspect.signature(predict)
+    run_method = get_run_method(runnable)
+    signature = inspect.signature(run_method)
     create_model_kwargs = {}
 
     order = 0
