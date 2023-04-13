@@ -126,54 +126,43 @@ def create_app(
         Run a training on the model
         """
         if runner.is_busy():
-            return JSONResponse(
-                {"detail": "Already running a training"}, status_code=409
-            )
-
-        # TODO: spec-compliant parsing of Prefer header.
-        respond_async = prefer == "respond-async"
+            return JSONResponse({"detail": "Already training."}, status_code=409)
 
         return _train(request=request)
 
-    def _train(*, request: TrainingRequest, respond_async: bool = False) -> Response:
+    def _train(*, request: TrainingRequest) -> Response:
         # [compat] If no body is supplied, assume that this model can be run
         # with empty input. This will throw a ValidationError if that's not
         # possible.
         if request is None:
-            request = PredictionRequest(input={})
+            request = TrainingResponse(input={})
         # [compat] If body is supplied but input is None, set it to an empty
         # dictionary so that later code can be simpler.
         if request.input is None:
             request.input = {}
 
         try:
-            # For now, we only ask the Runner to handle file uploads for
-            # async predictions. This is unfortunate but required to ensure
-            # backwards-compatible behaviour for synchronous predictions.
-            initial_response, async_result = runner.run(request, upload=respond_async)
+            initial_response, async_result = runner.run(request, upload=True)
         except RunnerBusyError:
             return JSONResponse(
                 {"detail": "Already running a prediction"}, status_code=409
             )
 
-        if respond_async:
-            return JSONResponse(jsonable_encoder(initial_response), status_code=202)
+        return JSONResponse(jsonable_encoder(initial_response), status_code=202)
 
+    @app.post("/trainings/{training}/cancel")
+    def cancel_training(training_id: str = Path(..., title="Training ID")) -> Any:
+        """
+        Cancel a running prediction
+        """
+        if not runner.is_busy():
+            return JSONResponse({}, status_code=404)
         try:
-            response = PredictionResponse(**async_result.get().dict())
-        except ValidationError as e:
-            _log_invalid_output(e)
-            raise HTTPException(status_code=500)
-
-        response_object = response.dict()
-        response_object["output"] = upload_files(
-            response_object["output"],
-            upload_file=lambda fh: upload_file(fh, request.output_file_prefix),  # type: ignore
-        )
-
-        # FIXME: clean up output files
-        encoded_response = jsonable_encoder(response_object)
-        return JSONResponse(content=encoded_response)
+            runner.cancel(training_id, JobType.TRAINING)
+        except UnknownPredictionError:
+            return JSONResponse({}, status_code=404)
+        else:
+            return JSONResponse({}, status_code=200)
 
     @app.post(
         "/predictions",
