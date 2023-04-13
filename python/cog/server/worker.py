@@ -14,9 +14,9 @@ from .eventtypes import (
     Done,
     Heartbeat,
     Log,
-    PredictionInput,
-    PredictionOutput,
-    PredictionOutputType,
+    JobInput,
+    JobOutput,
+    JobOutputType,
     Shutdown,
 )
 from .exceptions import (
@@ -28,7 +28,7 @@ from .helpers import StreamRedirector, WrappedStream
 
 _spawn = multiprocessing.get_context("spawn")
 
-_PublicEventType = Union[Done, Heartbeat, Log, PredictionOutput, PredictionOutputType]
+_PublicEventType = Union[Done, Heartbeat, Log, JobOutput, JobOutputType]
 
 
 @unique
@@ -41,13 +41,13 @@ class WorkerState(Enum):
 
 
 class Worker:
-    def __init__(self, predictor_ref: str, tee_output: bool = True):
+    def __init__(self, job_ref: str, tee_output: bool = True):
         self._state = WorkerState.NEW
         self._allow_cancel = False
 
         # A pipe with which to communicate with the child worker.
         self._events, child_events = _spawn.Pipe()
-        self._child = _ChildWorker(predictor_ref, child_events, tee_output)
+        self._child = _ChildWorker(job_ref, child_events, tee_output)
         self._terminating = False
 
     def setup(self) -> Iterable[_PublicEventType]:
@@ -63,7 +63,7 @@ class Worker:
         self._assert_state(WorkerState.READY)
         self._state = WorkerState.PROCESSING
         self._allow_cancel = True
-        self._events.send(PredictionInput(payload=payload))
+        self._events.send(JobInput(payload=payload))
 
         return self._wait(poll=poll)
 
@@ -203,7 +203,7 @@ class _ChildWorker(_spawn.Process):  # type: ignore
             ev = self._events.recv()
             if isinstance(ev, Shutdown):
                 break
-            elif isinstance(ev, PredictionInput):
+            elif isinstance(ev, JobInput):
                 self._predict(ev.payload)
             else:
                 print(f"Got unexpected event: {ev}", file=sys.stderr)
@@ -218,12 +218,12 @@ class _ChildWorker(_spawn.Process):  # type: ignore
 
             if result:
                 if isinstance(result, types.GeneratorType):
-                    self._events.send(PredictionOutputType(multi=True))
+                    self._events.send(JobOutputType(multi=True))
                     for r in result:
-                        self._events.send(PredictionOutput(payload=make_encodeable(r)))
+                        self._events.send(JobOutput(payload=make_encodeable(r)))
                 else:
-                    self._events.send(PredictionOutputType(multi=False))
-                    self._events.send(PredictionOutput(payload=make_encodeable(result)))
+                    self._events.send(JobOutputType(multi=False))
+                    self._events.send(JobOutput(payload=make_encodeable(result)))
         except CancelationException:
             done.canceled = True
         except Exception as e:

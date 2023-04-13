@@ -1,9 +1,10 @@
+from abc import ABC, abstractmethod
 import io
 import threading
 import traceback
 from datetime import datetime, timezone
 from multiprocessing.pool import AsyncResult, ThreadPool
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import requests
 import structlog
@@ -35,7 +36,7 @@ class UnknownPredictionError(Exception):
     pass
 
 
-class PredictionRunner:
+class Runner(ABC):
     def __init__(
         self,
         *,
@@ -46,7 +47,7 @@ class PredictionRunner:
         self._thread = None
         self._threadpool = ThreadPool(processes=1)
 
-        self._response: Optional[schema.PredictionResponse] = None
+        self._response: Optional[schema.JobResponse] = None
         self._result: Optional[AsyncResult] = None
 
         self._worker = Worker(predictor_ref=predictor_ref)
@@ -54,6 +55,16 @@ class PredictionRunner:
 
         self._shutdown_event = shutdown_event
         self._upload_url = upload_url
+
+    @property
+    @abstractmethod
+    def _work_method(self) -> Callable:
+        pass
+
+    @property
+    @abstractmethod
+    def _logger_context_key(self) -> str:
+        pass
 
     def setup(self) -> AsyncResult:
         if self.is_busy():
@@ -78,9 +89,9 @@ class PredictionRunner:
 
     # TODO: Make the return type AsyncResult[schema.PredictionResponse] when we
     # no longer have to support Python 3.8
-    def predict(
-        self, prediction: schema.PredictionRequest, upload: bool = True
-    ) -> Tuple[schema.PredictionResponse, AsyncResult]:
+    def run(
+        self, job: schema.JobRequest, upload: bool = True
+    ) -> Tuple[schema.JobResponse, AsyncResult]:
         # It's the caller's responsibility to not call us if we're busy.
         if self.is_busy():
             # If self._result is set, but self._response is not, we're still
@@ -88,22 +99,23 @@ class PredictionRunner:
             if self._response is None:
                 raise RunnerBusyError()
             assert self._result is not None
-            if prediction.id is not None and prediction.id == self._response.id:
+            if job.id is not None and job.id == self._response.id:
                 return (self._response, self._result)
             raise RunnerBusyError()
 
         # Set up logger context for main thread. The same thing happens inside
-        # the predict thread.
+        # the job thread.
+        logger_context = {self._logger_context_key: job.id}
         structlog.contextvars.clear_contextvars()
-        structlog.contextvars.bind_contextvars(prediction_id=prediction.id)
+        structlog.contextvars.bind_contextvars(**logger_context)
 
         self._should_cancel.clear()
         upload_url = self._upload_url if upload else None
-        event_handler = create_event_handler(prediction, upload_url=upload_url)
+        event_handler = create_event_handler(job, upload_url=upload_url)
 
         def cleanup(_: Optional[Any] = None) -> None:
-            if hasattr(prediction.input, "cleanup"):
-                prediction.input.cleanup()
+            if hasattr(job.input, "cleanup"):
+                job.input.cleanup()
 
         def handle_error(error: BaseException) -> None:
             # Re-raise the exception in order to more easily capture exc_info,
@@ -112,17 +124,18 @@ class PredictionRunner:
             try:
                 raise error
             except Exception:
-                log.error("caught exception while running prediction", exc_info=True)
+                log.error("caught exception while running job", exc_info=True)
                 self._shutdown_event.set()
 
         self._response = event_handler.response
         self._result = self._threadpool.apply_async(
-            func=predict,
+            func=self._work_method,
             kwds={
                 "worker": self._worker,
-                "request": prediction,
+                "request": job,
                 "event_handler": event_handler,
                 "should_cancel": self._should_cancel,
+                "logger_context": logger_context,
             },
             callback=cleanup,
             error_callback=handle_error,
@@ -146,19 +159,40 @@ class PredictionRunner:
         self._threadpool.terminate()
         self._threadpool.join()
 
-    def cancel(self, prediction_id: Optional[str] = None) -> None:
+    def cancel(self, id: Optional[str] = None) -> None:
         if not self.is_busy():
             return
         assert self._response is not None
-        if prediction_id is not None and prediction_id != self._response.id:
+        if id is not None and id != self._response.id:
             raise UnknownPredictionError()
         self._should_cancel.set()
 
 
+class PredictionRunner(Runner):
+    def __init__(
+        self,
+        *,
+        predictor_ref: str,
+        shutdown_event: threading.Event,
+        upload_url: Optional[str] = None,
+    ):
+        super().__init__(
+            predictor_ref=predictor_ref,
+            shutdown_event=shutdown_event,
+            upload_url=upload_url,
+        )
+
+        def _work_method(self):
+            return _predict
+
+        def _logger_context_key(self):
+            return "prediction_id"
+
+
 def create_event_handler(
-    prediction: schema.PredictionRequest, upload_url: Optional[str] = None
-) -> "PredictionEventHandler":
-    response = schema.PredictionResponse(**prediction.dict())
+    prediction: schema.JobRequest, upload_url: Optional[str] = None
+) -> "JobEventHandler":
+    response = schema.JobResponse(**prediction.dict())
 
     webhook = prediction.webhook
     events_filter = (
@@ -173,7 +207,7 @@ def create_event_handler(
     if upload_url is not None:
         file_uploader = generate_file_uploader(upload_url)
 
-    event_handler = PredictionEventHandler(
+    event_handler = JobEventHandler(
         response, webhook_sender=webhook_sender, file_uploader=file_uploader
     )
 
@@ -192,10 +226,10 @@ def generate_file_uploader(upload_url: str) -> Callable:
     return file_uploader
 
 
-class PredictionEventHandler:
+class JobEventHandler:
     def __init__(
         self,
-        p: schema.PredictionResponse,
+        p: schema.JobResponse,
         webhook_sender: Optional[Callable] = None,
         file_uploader: Optional[Callable] = None,
     ):
@@ -212,7 +246,7 @@ class PredictionEventHandler:
         self._send_webhook(schema.WebhookEvent.START)
 
     @property
-    def response(self) -> schema.PredictionResponse:
+    def response(self) -> schema.JobResponse:
         return self.p
 
     def set_output(self, output: Any) -> None:
@@ -322,13 +356,39 @@ def predict(
     *,
     worker: Worker,
     request: schema.PredictionRequest,
-    event_handler: PredictionEventHandler,
+    event_handler: JobEventHandler,
     should_cancel: threading.Event,
-) -> schema.PredictionResponse:
-
+    logger_context: Dict[str, Any],
+) -> schema.JobResponse:
     # Set up logger context within prediction thread.
     structlog.contextvars.clear_contextvars()
-    structlog.contextvars.bind_contextvars(prediction_id=request.id)
+    structlog.contextvars.bind_contextvars(**logger_context)
+
+    try:
+        return _predict(
+            worker=worker,
+            request=request,
+            event_handler=event_handler,
+            should_cancel=should_cancel,
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        event_handler.append_logs(tb)
+        event_handler.failed(error=str(e))
+        raise
+
+
+def train(
+    *,
+    worker: Worker,
+    request: schema.TrainingRequest,
+    event_handler: JobEventHandler,
+    should_cancel: threading.Event,
+    logger_context: Dict[str, Any],
+) -> schema.JobResponse:
+    # Set up logger context within prediction thread.
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(**logger_context)
 
     try:
         return _predict(
@@ -347,10 +407,10 @@ def predict(
 def _predict(
     *,
     worker: Worker,
-    request: schema.PredictionRequest,
-    event_handler: PredictionEventHandler,
+    request: schema.JobRequest,
+    event_handler: JobEventHandler,
     should_cancel: threading.Event,
-) -> schema.PredictionResponse:
+) -> schema.JobResponse:
     initial_prediction = request.dict()
 
     output_type = None

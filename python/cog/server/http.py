@@ -30,7 +30,7 @@ from ..predictor import (
     load_config,
     load_predictor_from_ref,
 )
-from .runner import PredictionRunner, RunnerBusyError, UnknownPredictionError
+from .runner import Runner, RunnerBusyError, UnknownPredictionError
 
 log = structlog.get_logger("cog.server.http")
 
@@ -62,8 +62,8 @@ def create_app(
 
     predictor_ref = get_predictor_ref(config, mode)
 
-    runner = PredictionRunner(
-        predictor_ref=predictor_ref,
+    runner = Runner(
+        job_ref=predictor_ref,
         shutdown_event=shutdown_event,
         upload_url=upload_url,
     )
@@ -121,7 +121,7 @@ def create_app(
         response_model=TrainingResponse,
         response_model_exclude_unset=True,
     )
-    def predict(request: PredictionRequest = Body(default=None), prefer: Union[str, None] = Header(default=None)) -> Any:  # type: ignore
+    def train(request: TrainingRequest = Body(default=None), prefer: Union[str, None] = Header(default=None)) -> Any:  # type: ignore
         """
         Run a training on the model
         """
@@ -133,7 +133,49 @@ def create_app(
         # TODO: spec-compliant parsing of Prefer header.
         respond_async = prefer == "respond-async"
 
-        return _predict(request=request, respond_async=respond_async)
+        return _train(request=request)
+
+    def _train(*, request: TrainingRequest, respond_async: bool = False) -> Response:
+        # [compat] If no body is supplied, assume that this model can be run
+        # with empty input. This will throw a ValidationError if that's not
+        # possible.
+        if request is None:
+            request = PredictionRequest(input={})
+        # [compat] If body is supplied but input is None, set it to an empty
+        # dictionary so that later code can be simpler.
+        if request.input is None:
+            request.input = {}
+
+        try:
+            # For now, we only ask the Runner to handle file uploads for
+            # async predictions. This is unfortunate but required to ensure
+            # backwards-compatible behaviour for synchronous predictions.
+            initial_response, async_result = runner.predict(
+                request, upload=respond_async
+            )
+        except RunnerBusyError:
+            return JSONResponse(
+                {"detail": "Already running a prediction"}, status_code=409
+            )
+
+        if respond_async:
+            return JSONResponse(jsonable_encoder(initial_response), status_code=202)
+
+        try:
+            response = PredictionResponse(**async_result.get().dict())
+        except ValidationError as e:
+            _log_invalid_output(e)
+            raise HTTPException(status_code=500)
+
+        response_object = response.dict()
+        response_object["output"] = upload_files(
+            response_object["output"],
+            upload_file=lambda fh: upload_file(fh, request.output_file_prefix),  # type: ignore
+        )
+
+        # FIXME: clean up output files
+        encoded_response = jsonable_encoder(response_object)
+        return JSONResponse(content=encoded_response)
 
     @app.post(
         "/predictions",
@@ -152,7 +194,7 @@ def create_app(
         # TODO: spec-compliant parsing of Prefer header.
         respond_async = prefer == "respond-async"
 
-        return _predict(request=request, respond_async=respond_async)
+        return _predict(request=request)
 
     @app.put(
         "/predictions/{prediction_id}",
@@ -188,6 +230,11 @@ def create_app(
 
         return _predict(request=request, respond_async=respond_async)
 
+    def _execute(
+        *, request: schema.JobRequest, respond_async: bool = False
+    ) -> Response:
+        pass
+
     def _predict(
         *, request: PredictionRequest, respond_async: bool = False
     ) -> Response:
@@ -202,7 +249,7 @@ def create_app(
             request.input = {}
 
         try:
-            # For now, we only ask PredictionRunner to handle file uploads for
+            # For now, we only ask the Runner to handle file uploads for
             # async predictions. This is unfortunate but required to ensure
             # backwards-compatible behaviour for synchronous predictions.
             initial_response, async_result = runner.predict(
