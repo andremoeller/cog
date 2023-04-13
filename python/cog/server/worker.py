@@ -9,7 +9,12 @@ from multiprocessing.connection import Connection
 from typing import Any, Dict, Iterable, Optional, TextIO, Union
 
 from ..json import make_encodeable
-from ..predictor import BasePredictor, load_predictor_from_ref, get_predict, run_setup
+from ..predictor import (
+    Runnable,
+    load_runnable_from_ref,
+    get_run_method,
+    run_setup,
+)
 from .eventtypes import (
     Done,
     Heartbeat,
@@ -55,9 +60,9 @@ class Worker:
         self._state = WorkerState.STARTING
         self._child.start()
 
-        return self._wait(raise_on_error="Predictor errored during setup")
+        return self._wait(raise_on_error="Errored during setup")
 
-    def predict(
+    def run(
         self, payload: Dict[str, Any], poll: Optional[float] = None
     ) -> Iterable[_PublicEventType]:
         self._assert_state(WorkerState.READY)
@@ -133,19 +138,19 @@ class Worker:
         if not self._child.is_alive() and not self._terminating:
             exitcode = self._child.exitcode
             raise FatalWorkerException(
-                f"Prediction failed for an unknown reason. It might have run out of memory? (exitcode {exitcode})"
+                f"Run failed for an unknown reason. It might have run out of memory? (exitcode {exitcode})"
             )
 
 
 class _ChildWorker(_spawn.Process):  # type: ignore
     def __init__(
         self,
-        predictor_ref: str,
+        job_ref: str,
         events: Connection,
         tee_output: bool = True,
     ):
-        self._predictor_ref = predictor_ref
-        self._predictor: Optional[BasePredictor] = None
+        self._job_ref = job_ref
+        self._runnable: Optional[Runnable] = None
         self._events = events
         self._tee_output = tee_output
         self._cancelable = False
@@ -179,10 +184,10 @@ class _ChildWorker(_spawn.Process):  # type: ignore
     def _setup(self) -> None:
         done = Done()
         try:
-            self._predictor = load_predictor_from_ref(self._predictor_ref)
+            self._runnable = load_runnable_from_ref(self._job_ref)
             # Could be a function or a class
-            if hasattr(self._predictor, "setup"):
-                run_setup(self._predictor)
+            if hasattr(self._runnable, "setup"):
+                run_setup(self._runnable)
         except Exception as e:
             traceback.print_exc()
             done.error = True
@@ -204,17 +209,17 @@ class _ChildWorker(_spawn.Process):  # type: ignore
             if isinstance(ev, Shutdown):
                 break
             elif isinstance(ev, JobInput):
-                self._predict(ev.payload)
+                self._work(ev.payload)
             else:
                 print(f"Got unexpected event: {ev}", file=sys.stderr)
 
-    def _predict(self, payload: Dict[str, Any]) -> None:
-        assert self._predictor
+    def _work(self, payload: Dict[str, Any]) -> None:
+        assert self._runnable
         done = Done()
         self._cancelable = True
         try:
-            predict = get_predict(self._predictor)
-            result = predict(**payload)
+            run = get_run_method(self._runnable)
+            result = run(**payload)
 
             if result:
                 if isinstance(result, types.GeneratorType):

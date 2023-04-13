@@ -26,9 +26,9 @@ from ..logging import setup_logging
 from ..predictor import (
     get_input_type,
     get_output_type,
-    get_predictor_ref,
+    get_runnable_ref,
     load_config,
-    load_predictor_from_ref,
+    load_runnable_from_ref,
 )
 from .runner import Runner, RunnerBusyError, UnknownPredictionError
 
@@ -60,7 +60,7 @@ def create_app(
     app.state.setup_result = None
     app.state.setup_result_payload = None
 
-    predictor_ref = get_predictor_ref(config, mode)
+    predictor_ref = get_runnable_ref(config, mode)
 
     runner = Runner(
         job_ref=predictor_ref,
@@ -68,7 +68,7 @@ def create_app(
         upload_url=upload_url,
     )
     # TODO: avoid loading predictor code in this process
-    predictor = load_predictor_from_ref(predictor_ref)
+    predictor = load_runnable_from_ref(predictor_ref)
 
     InputType = get_input_type(predictor)
     OutputType = get_output_type(predictor)
