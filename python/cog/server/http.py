@@ -78,6 +78,11 @@ def create_app(
         input_type=InputType, output_type=OutputType
     )
 
+    TrainingRequest = schema.TrainingRequest.with_types(input_type=InputType)
+    TrainingResponse = schema.TrainingResponse.with_types(
+        input_type=InputType, output_type=OutputType
+    )
+
     @app.on_event("startup")
     def startup() -> None:
         # https://github.com/tiangolo/fastapi/issues/4221
@@ -110,6 +115,25 @@ def create_app(
                 "setup": app.state.setup_result_payload,
             }
         )
+
+    @app.post(
+        "/trainings",
+        response_model=TrainingResponse,
+        response_model_exclude_unset=True,
+    )
+    def predict(request: PredictionRequest = Body(default=None), prefer: Union[str, None] = Header(default=None)) -> Any:  # type: ignore
+        """
+        Run a training on the model
+        """
+        if runner.is_busy():
+            return JSONResponse(
+                {"detail": "Already running a training"}, status_code=409
+            )
+
+        # TODO: spec-compliant parsing of Prefer header.
+        respond_async = prefer == "respond-async"
+
+        return _predict(request=request, respond_async=respond_async)
 
     @app.post(
         "/predictions",
