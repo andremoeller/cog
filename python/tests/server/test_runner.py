@@ -19,6 +19,7 @@ from cog.server.runner import (
     UnknownPredictionError,
     work,
 )
+from python.cog.server.runner import JobType
 
 
 def _fixture_path(name):
