@@ -105,15 +105,21 @@ class Runner(ABC):
                 return (self._response, self._result)
             raise RunnerBusyError()
 
+        if isinstance(request, schema.PredictionRequest):
+            job_type = JobType.PREDICTION
+        else:
+            job_type = JobType.TRAINING
         # Set up logger context for main thread. The same thing happens inside
         # the job thread.
-        logger_context_key = get_logger_context_key(request)
+        logger_context_key = get_logger_context_key(job_type)
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(**{logger_context_key: request.id})
 
         self._should_cancel.clear()
         upload_url = self._upload_url if upload else None
-        event_handler = create_event_handler(request, upload_url=upload_url)
+        event_handler = create_event_handler(
+            request, upload_url=upload_url, job_type=job_type
+        )
 
         def cleanup(_: Optional[Any] = None) -> None:
             if hasattr(request.input, "cleanup"):
@@ -137,6 +143,7 @@ class Runner(ABC):
                 "request": request,
                 "event_handler": event_handler,
                 "should_cancel": self._should_cancel,
+                "job_type": job_type,
             },
             callback=cleanup,
             error_callback=handle_error,
@@ -175,11 +182,11 @@ class Runner(ABC):
 
 
 def create_event_handler(
-    request: schema.JobRequest, upload_url: Optional[str] = None
+    request: schema.JobRequest,
+    upload_url: Optional[str] = None,
+    job_type: JobType = JobType.PREDICTION,
 ) -> "JobEventHandler":
-    if isinstance(request, schema.PredictionRequest):
-        response = schema.PredictionResponse(**request.dict())
-    # response = schema.JobResponse(**request.dict())
+    response = schema.JobResponse(**request.dict())
 
     webhook = request.webhook
     events_filter = (
@@ -195,7 +202,10 @@ def create_event_handler(
         file_uploader = generate_file_uploader(upload_url)
 
     event_handler = JobEventHandler(
-        response, webhook_sender=webhook_sender, file_uploader=file_uploader
+        response,
+        webhook_sender=webhook_sender,
+        file_uploader=file_uploader,
+        job_type=job_type,
     )
 
     return event_handler
@@ -219,18 +229,17 @@ class JobEventHandler:
         response: schema.JobResponse,
         webhook_sender: Optional[Callable] = None,
         file_uploader: Optional[Callable] = None,
+        job_type: JobType = JobType.PREDICTION,
     ):
-        # Dispatch on type
-        if isinstance(response, schema.PredictionResponse):
+        if job_type == JobType.PREDICTION:
             self._runnable_name = "prediction"
             self._runnable_class_name = "Predictor"
             self._time_metric_name = "predict_time"
-        elif isinstance(response, schema.TrainingResponse):
+        else:
             self._runnable_name = "training"
             self._runnable_class_name = "Trainer"
             self._time_metric_name = "training_time"
-        else:
-            raise ValueError(f"Response {response} has invalid type: {type(response)}")
+
         log.info(f"starting {self._runnable_name}")
 
         self.job = response
@@ -355,13 +364,11 @@ def setup(*, worker: Worker):
     }
 
 
-def get_logger_context_key(request: schema.JobRequest):
-    if isinstance(request, schema.PredictionRequest):
+def get_logger_context_key(job_type: JobType) -> str:
+    if job_type == JobType.PREDICTION:
         return "prediction_id"
-    elif isinstance(request, schema.TrainingRequest):
-        return "training_id"
     else:
-        raise ValueError(f"Request {request} has invalid type: {type(request)}")
+        return "training_id"
 
 
 def work(
@@ -370,11 +377,11 @@ def work(
     request: schema.JobRequest,
     event_handler: JobEventHandler,
     should_cancel: threading.Event,
+    job_type: JobType,
 ) -> schema.JobResponse:
     # Set up logger context within prediction thread.
     structlog.contextvars.clear_contextvars()
-    print(type(request))
-    logger_context_key = get_logger_context_key(request)
+    logger_context_key = get_logger_context_key(job_type)
     structlog.contextvars.bind_contextvars(**{logger_context_key: request.id})
 
     try:
