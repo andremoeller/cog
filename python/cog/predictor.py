@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Type, Union
 from typing_extensions import get_origin, get_args, Annotated
 import yaml
 
-from .errors import ConfigDoesNotExist, PredictorNotSet
+from .errors import ConfigDoesNotExist, PredictorNotSet, TrainerNotSet
 from .types import (
     Input,
     Path as CogPath,
@@ -134,18 +134,25 @@ def load_config() -> Dict[str, Any]:
     return config
 
 
-def load_runnable(config: Dict[str, Any]) -> Runnable:
+def load_runnable(config: Dict[str, Any]) -> Optional[Runnable]:
     """
     Constructs an instance of the user-defined class or method from a config.
     """
 
-    ref = get_runnable_ref(config)
+    try:
+        ref = get_runnable_ref(config)
+    except TrainerNotSet:
+        return None
     return load_runnable_from_ref(ref)
 
 
 def get_runnable_ref(config: Dict[str, Any], mode: str = "predict") -> str:
     if mode not in ["predict", "train"]:
         raise ValueError(f"Invalid mode: {mode}")
+
+    # trainer is experimental and optional
+    if mode not in config and mode == "train":
+        raise TrainerNotSet("Trainer not in cog.yaml")
 
     if mode not in config:
         raise PredictorNotSet(f"Can't run: '{mode}' option not found in cog.yaml")

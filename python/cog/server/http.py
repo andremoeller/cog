@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from pydantic.error_wrappers import ErrorWrapper
 
 from .. import schema
+from ..errors import TrainerNotSet
 from ..files import upload_file
 from ..json import upload_files
 from ..logging import setup_logging
@@ -30,7 +31,9 @@ from ..predictor import (
     load_config,
     load_runnable_from_ref,
 )
+
 from .runner import JobType, Runner, RunnerBusyError, UnknownPredictionError
+
 
 log = structlog.get_logger("cog.server.http")
 
@@ -49,7 +52,6 @@ def create_app(
     shutdown_event: threading.Event,
     threads: int = 1,
     upload_url: Optional[str] = None,
-    mode: str = "predict",
 ) -> FastAPI:
     app = FastAPI(
         title="Cog",  # TODO: mention model name?
@@ -57,42 +59,70 @@ def create_app(
     )
 
     app.state.health = Health.STARTING
-    app.state.setup_result = None
-    app.state.setup_result_payload = None
+    app.state.predictor_setup_result = None
+    app.state.predictor_setup_result_payload = None
 
-    predictor_ref = get_runnable_ref(config, mode)
+    app.state.trainer_setup_result = None
+    app.state.trainer_setup_result_payload = None
 
-    runner = Runner(
+    predictor_ref = get_runnable_ref(config, "predict")
+
+    prediction_runner = Runner(
         job_ref=predictor_ref,
         shutdown_event=shutdown_event,
         upload_url=upload_url,
     )
-    # TODO: avoid loading predictor code in this process
     predictor = load_runnable_from_ref(predictor_ref)
+    PredictorInputType = get_input_type(predictor)
+    PredictorOutputType = get_output_type(predictor)
 
-    InputType = get_input_type(predictor)
-    OutputType = get_output_type(predictor)
-
-    PredictionRequest = schema.PredictionRequest.with_types(input_type=InputType)
+    PredictionRequest = schema.PredictionRequest.with_types(
+        input_type=PredictorInputType
+    )
     PredictionResponse = schema.PredictionResponse.with_types(
-        input_type=InputType, output_type=OutputType
+        input_type=PredictorInputType, output_type=PredictorOutputType
     )
 
-    TrainingRequest = schema.TrainingRequest.with_types(input_type=InputType)
-    TrainingResponse = schema.TrainingResponse.with_types(
-        input_type=InputType, output_type=OutputType
-    )
+    # Check if a trainer is specified.
+    # If not, create stubs for training API and respond with 501 errors.
+    try:
+        trainer_ref = get_runnable_ref(config, "train")
+    except TrainerNotSet:
+        trainer_runner = None
+        # TODO(akm): default to a different schema; ints are placeholders.
+        TrainingRequest = schema.TrainingRequest.with_types(input_type=int)
+        TrainingResponse = schema.TrainingResponse.with_types(
+            input_type=int, output_type=int
+        )
+    else:
+        trainer_runner = Runner(
+            job_ref=trainer_ref,
+            shutdown_event=shutdown_event,
+            upload_url=upload_url,
+        )
+        trainer = load_runnable_from_ref(trainer_ref)
+        TrainerInputType = get_input_type(trainer)
+        TrainerOutputType = get_output_type(trainer)
+
+        TrainingRequest = schema.TrainingRequest.with_types(input_type=TrainerInputType)
+        TrainingResponse = schema.TrainingResponse.with_types(
+            input_type=TrainerInputType, output_type=TrainerOutputType
+        )
 
     @app.on_event("startup")
     def startup() -> None:
         # https://github.com/tiangolo/fastapi/issues/4221
         RunVar("_default_thread_limiter").set(CapacityLimiter(threads))  # type: ignore
 
-        app.state.setup_result = runner.setup()
+        app.state.predictor_setup_result = prediction_runner.setup()
+        if trainer_runner:
+            app.state.trainer_setup_result = trainer_runner.setup()
 
     @app.on_event("shutdown")
     def shutdown() -> None:
-        runner.shutdown()
+        prediction_runner.shutdown()
+        if trainer_runner:
+            trainer_runner.shutdown()
 
     @app.get("/")
     def root() -> Any:
@@ -106,13 +136,13 @@ def create_app(
     def healthcheck() -> Any:
         _check_setup_result()
         if app.state.health == Health.READY:
-            health = Health.BUSY if runner.is_busy() else Health.READY
+            health = Health.BUSY if prediction_runner.is_busy() else Health.READY
         else:
             health = app.state.health
         return jsonable_encoder(
             {
                 "status": health.name,
-                "setup": app.state.setup_result_payload,
+                "setup": app.state.predictor_setup_result_payload,
             }
         )
 
@@ -125,7 +155,11 @@ def create_app(
         """
         Run a training on the model
         """
-        if runner.is_busy():
+        if not trainer_runner:
+            return JSONResponse(
+                {"detail": "Trainer is not implemented in cog.yaml"}, status_code=501
+            )
+        if trainer_runner.is_busy():
             return JSONResponse({"detail": "Already training."}, status_code=409)
 
         return _train(request=request)
@@ -142,7 +176,7 @@ def create_app(
             request.input = {}
 
         try:
-            initial_response, async_result = runner.run(request, upload=True)
+            initial_response, async_result = prediction_runner.run(request, upload=True)
         except RunnerBusyError:
             return JSONResponse(
                 {"detail": "Already running a prediction"}, status_code=409
@@ -153,12 +187,16 @@ def create_app(
     @app.post("/trainings/{training}/cancel")
     def cancel_training(training_id: str = Path(..., title="Training ID")) -> Any:
         """
-        Cancel a running prediction
+        Cancel a running training.
         """
-        if not runner.is_busy():
+        if not trainer_runner:
+            return JSONResponse(
+                {"detail": "Trainer is not implemented in cog.yaml"}, status_code=501
+            )
+        if not trainer_runner.is_busy():
             return JSONResponse({}, status_code=404)
         try:
-            runner.cancel(training_id, JobType.TRAINING)
+            trainer_runner.cancel(training_id, JobType.TRAINING)
         except UnknownPredictionError:
             return JSONResponse({}, status_code=404)
         else:
@@ -173,7 +211,7 @@ def create_app(
         """
         Run a single prediction on the model
         """
-        if runner.is_busy():
+        if prediction_runner.is_busy():
             return JSONResponse(
                 {"detail": "Already running a prediction"}, status_code=409
             )
@@ -234,7 +272,9 @@ def create_app(
             # For now, we only ask the Runner to handle file uploads for
             # async predictions. This is unfortunate but required to ensure
             # backwards-compatible behaviour for synchronous predictions.
-            initial_response, async_result = runner.run(request, upload=respond_async)
+            initial_response, async_result = prediction_runner.run(
+                request, upload=respond_async
+            )
         except RunnerBusyError:
             return JSONResponse(
                 {"detail": "Already running a prediction"}, status_code=409
@@ -264,10 +304,10 @@ def create_app(
         """
         Cancel a running prediction
         """
-        if not runner.is_busy():
+        if not prediction_runner.is_busy():
             return JSONResponse({}, status_code=404)
         try:
-            runner.cancel(prediction_id, JobType.PREDICTION)
+            prediction_runner.cancel(prediction_id, JobType.PREDICTION)
         except UnknownPredictionError:
             return JSONResponse({}, status_code=404)
         else:
@@ -280,23 +320,24 @@ def create_app(
         return JSONResponse({}, status_code=200)
 
     def _check_setup_result() -> Any:
-        if app.state.setup_result is None:
+        # TODO(akm): add trainer setup result to health checks
+        if app.state.predictor_setup_result is None:
             return
 
-        if not app.state.setup_result.ready():
+        if not app.state.predictor_setup_result.ready():
             return
 
-        result = app.state.setup_result.get()
+        result = app.state.predictor_setup_result.get()
 
         if result["status"] == schema.Status.SUCCEEDED:
             app.state.health = Health.READY
         else:
             app.state.health = Health.SETUP_FAILED
 
-        app.state.setup_result_payload = result
+        app.state.predictor_setup_result_payload = result
 
         # Reset app.state.setup_result so future calls are a no-op
-        app.state.setup_result = None
+        app.state.predictor_setup_result = None
 
     return app
 
@@ -375,14 +416,6 @@ if __name__ == "__main__":
         default=False,
         help="Ignore SIGTERM and wait for a request to /shutdown (or a SIGINT) before exiting",
     )
-    parser.add_argument(
-        "--x-mode",
-        dest="mode",
-        type=str,
-        default="predict",
-        choices=["predict", "train"],
-        help="Experimental: Run in 'predict' or 'train' mode",
-    )
     args = parser.parse_args()
 
     # log level is configurable so we can make it quiet or verbose for `cog predict`
@@ -407,7 +440,6 @@ if __name__ == "__main__":
         shutdown_event=shutdown_event,
         threads=threads,
         upload_url=args.upload_url,
-        mode=args.mode,
     )
 
     port = int(os.getenv("PORT", 5000))
