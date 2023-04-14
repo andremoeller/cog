@@ -36,9 +36,6 @@ class JobRequest(JobBaseModel):
     id: t.Optional[str]
     created_at: t.Optional[datetime]
 
-    # TODO: deprecate this
-    output_file_prefix: t.Optional[str]
-
     webhook: t.Optional[pydantic.AnyHttpUrl]
     webhook_events_filter: t.Optional[
         t.Set[WebhookEvent]
@@ -92,6 +89,8 @@ class TrainingResponse(JobResponse):
 
 
 class PredictionRequest(JobRequest):
+    # TODO: deprecate this
+    output_file_prefix: t.Optional[str]
     pass
 
 

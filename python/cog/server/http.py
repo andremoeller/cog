@@ -52,6 +52,7 @@ def create_app(
     shutdown_event: threading.Event,
     threads: int = 1,
     upload_url: Optional[str] = None,
+    mode: str = "predict",
 ) -> FastAPI:
     app = FastAPI(
         title="Cog",  # TODO: mention model name?
@@ -59,70 +60,37 @@ def create_app(
     )
 
     app.state.health = Health.STARTING
-    app.state.predictor_setup_result = None
-    app.state.predictor_setup_result_payload = None
+    app.state.setup_result = None
+    app.state.setup_result_payload = None
 
-    app.state.trainer_setup_result = None
-    app.state.trainer_setup_result_payload = None
+    runnable_ref = get_runnable_ref(config, mode)
 
-    predictor_ref = get_runnable_ref(config, "predict")
-
-    prediction_runner = Runner(
-        job_ref=predictor_ref,
+    runner = Runner(
+        predictor_ref=runnable_ref,
         shutdown_event=shutdown_event,
         upload_url=upload_url,
     )
-    predictor = load_runnable_from_ref(predictor_ref)
-    PredictorInputType = get_input_type(predictor)
-    PredictorOutputType = get_output_type(predictor)
+    # TODO: avoid loading predictor code in this process
+    predictor = load_runnable_from_ref(runnable_ref)
 
-    PredictionRequest = schema.PredictionRequest.with_types(
-        input_type=PredictorInputType
-    )
+    InputType = get_input_type(predictor)
+    OutputType = get_output_type(predictor)
+
+    PredictionRequest = schema.PredictionRequest.with_types(input_type=InputType)
     PredictionResponse = schema.PredictionResponse.with_types(
-        input_type=PredictorInputType, output_type=PredictorOutputType
+        input_type=InputType, output_type=OutputType
     )
-
-    # Check if a trainer is specified.
-    # If not, create stubs for training API and respond with 501 errors.
-    try:
-        trainer_ref = get_runnable_ref(config, "train")
-    except TrainerNotSet:
-        trainer_runner = None
-        # TODO(akm): default to a different schema; ints are placeholders.
-        TrainingRequest = schema.TrainingRequest.with_types(input_type=int)
-        TrainingResponse = schema.TrainingResponse.with_types(
-            input_type=int, output_type=int
-        )
-    else:
-        trainer_runner = Runner(
-            job_ref=trainer_ref,
-            shutdown_event=shutdown_event,
-            upload_url=upload_url,
-        )
-        trainer = load_runnable_from_ref(trainer_ref)
-        TrainerInputType = get_input_type(trainer)
-        TrainerOutputType = get_output_type(trainer)
-
-        TrainingRequest = schema.TrainingRequest.with_types(input_type=TrainerInputType)
-        TrainingResponse = schema.TrainingResponse.with_types(
-            input_type=TrainerInputType, output_type=TrainerOutputType
-        )
 
     @app.on_event("startup")
     def startup() -> None:
         # https://github.com/tiangolo/fastapi/issues/4221
         RunVar("_default_thread_limiter").set(CapacityLimiter(threads))  # type: ignore
 
-        app.state.predictor_setup_result = prediction_runner.setup()
-        if trainer_runner:
-            app.state.trainer_setup_result = trainer_runner.setup()
+        app.state.predictor_setup_result = runner.setup()
 
     @app.on_event("shutdown")
     def shutdown() -> None:
-        prediction_runner.shutdown()
-        if trainer_runner:
-            trainer_runner.shutdown()
+        runner.shutdown()
 
     @app.get("/")
     def root() -> Any:
@@ -136,7 +104,7 @@ def create_app(
     def healthcheck() -> Any:
         _check_setup_result()
         if app.state.health == Health.READY:
-            health = Health.BUSY if prediction_runner.is_busy() else Health.READY
+            health = Health.BUSY if runner.is_busy() else Health.READY
         else:
             health = app.state.health
         return jsonable_encoder(
@@ -176,7 +144,7 @@ def create_app(
             request.input = {}
 
         try:
-            initial_response, async_result = prediction_runner.run(request, upload=True)
+            initial_response, async_result = runner.run(request, upload=True)
         except RunnerBusyError:
             return JSONResponse(
                 {"detail": "Already running a prediction"}, status_code=409
@@ -211,7 +179,7 @@ def create_app(
         """
         Run a single prediction on the model
         """
-        if prediction_runner.is_busy():
+        if runner.is_busy():
             return JSONResponse(
                 {"detail": "Already running a prediction"}, status_code=409
             )
@@ -272,9 +240,7 @@ def create_app(
             # For now, we only ask the Runner to handle file uploads for
             # async predictions. This is unfortunate but required to ensure
             # backwards-compatible behaviour for synchronous predictions.
-            initial_response, async_result = prediction_runner.run(
-                request, upload=respond_async
-            )
+            initial_response, async_result = runner.run(request, upload=respond_async)
         except RunnerBusyError:
             return JSONResponse(
                 {"detail": "Already running a prediction"}, status_code=409
@@ -304,10 +270,10 @@ def create_app(
         """
         Cancel a running prediction
         """
-        if not prediction_runner.is_busy():
+        if not runner.is_busy():
             return JSONResponse({}, status_code=404)
         try:
-            prediction_runner.cancel(prediction_id, JobType.PREDICTION)
+            runner.cancel(prediction_id, JobType.PREDICTION)
         except UnknownPredictionError:
             return JSONResponse({}, status_code=404)
         else:
