@@ -25,6 +25,7 @@ from cog.server.eventtypes import (
 )
 from cog.server.exceptions import FatalWorkerException, InvalidStateException
 from cog.server.worker import Worker
+from tests.server.conftest import _fixture_path
 
 # Set a longer deadline on CI as the instances are a bit slower.
 settings.register_profile("ci", max_examples=100, deadline=1000)
@@ -145,11 +146,6 @@ def _process(events, swallow_exceptions=False):
     result.stdout = "".join(stdout)
     result.stderr = "".join(stderr)
     return result
-
-
-def _fixture_path(name):
-    test_dir = os.path.dirname(os.path.realpath(__file__))
-    return os.path.join(test_dir, f"fixtures/{name}.py") + ":Predictor"
 
 
 @pytest.mark.parametrize("name,payloads", SETUP_FATAL_FIXTURES)
@@ -298,6 +294,30 @@ def test_cancel_is_safe():
         assert not result2.exception
         assert not result2.done.canceled
         assert result2.output == "done in 0.1 seconds"
+    finally:
+        w.terminate()
+
+
+def test_cancel_hook():
+    """
+    Tests that the worker calls the cancel method on a Trainer that implements it.
+    """
+
+    try:
+        w = Worker(job_ref=_fixture_path("trainer_sleep.py:Trainer"), tee_output=True)
+        result = _process(w.setup(), swallow_exceptions=True)
+        assert result.stdout == "Setting up.\n"
+
+        canceled = False
+        logs = []
+        for event in w.run({"sleep": 0.5}, poll=0.1):
+            if not canceled:
+                w.cancel()
+                canceled = True
+            if isinstance(event, Log):
+                logs.append(event.message)
+
+        assert logs[0] == "Canceling.\n"
     finally:
         w.terminate()
 

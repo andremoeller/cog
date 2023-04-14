@@ -96,6 +96,8 @@ class Worker:
         if self._allow_cancel and self._child.is_alive():
             os.kill(self._child.pid, signal.SIGUSR1)
             self._allow_cancel = False
+            return self._wait(raise_on_error="Errored during cancel")
+        return []
 
     def _assert_state(self, state: WorkerState) -> None:
         if self._state != state:

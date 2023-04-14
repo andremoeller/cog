@@ -44,8 +44,9 @@ from enum import Enum
 
 
 class JobType(Enum):
-    PREDICTION = 1
-    TRAINING = 2
+    NONE = 1
+    PREDICTION = 2
+    TRAINING = 3
 
 
 class Runner(ABC):
@@ -180,10 +181,8 @@ def create_event_handler(
 ) -> "JobEventHandler":
     if isinstance(request, schema.PredictionRequest):
         response = schema.PredictionResponse(**request.dict())
-        job_type = JobType.PREDICTION
     else:
         response = schema.TrainingResponse(**request.dict())
-        job_type = JobType.TRAINING
 
     webhook = request.webhook
     events_filter = (
@@ -200,7 +199,6 @@ def create_event_handler(
 
     event_handler = JobEventHandler(
         response,
-        job_type=job_type,
         webhook_sender=webhook_sender,
         file_uploader=file_uploader,
     )
@@ -224,18 +222,21 @@ class JobEventHandler:
     def __init__(
         self,
         response: schema.JobResponse,
-        job_type: JobType = JobType.PREDICTION,
         webhook_sender: Optional[Callable] = None,
         file_uploader: Optional[Callable] = None,
     ):
-        if job_type == JobType.TRAINING:
+        if isinstance(response, schema.TrainingResponse):
             self._runnable_name = "training"
             self._runnable_class_name = "Trainer"
             self._time_metric_name = "training_time"
-        else:
+        elif isinstance(response, schema.PredictionResponse):
             self._runnable_name = "prediction"
             self._runnable_class_name = "Predictor"
             self._time_metric_name = "predict_time"
+        else:
+            self._runnable_name = "job"
+            self._runnable_class_name = "job"
+            self._time_metric_name = "job_time"
 
         log.info(f"starting {self._runnable_name}")
 
@@ -366,6 +367,8 @@ def get_logger_context_key(request: schema.JobRequest):
         return "prediction_id"
     elif isinstance(request, schema.TrainingRequest):
         return "training_id"
+    elif isinstance(request, schema.JobRequest):
+        return "id"
     else:
         raise ValueError(f"Request {request} has invalid type: {type(request)}")
 

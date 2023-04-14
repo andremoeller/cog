@@ -5,10 +5,12 @@ from datetime import datetime
 from unittest import mock
 
 from cog.schema import (
-    PredictionRequest,
-    PredictionResponse,
+    JobRequest,
+    JobResponse,
     Status,
     WebhookEvent,
+    PredictionRequest,
+    PredictionResponse,
     TrainingRequest,
     TrainingResponse,
 )
@@ -25,13 +27,8 @@ from cog.server.runner import (
     RunnerBusyError,
     UnknownPredictionError,
     work,
-    JobType,
 )
-
-
-def _fixture_path(name):
-    test_dir = os.path.dirname(os.path.realpath(__file__))
-    return os.path.join(test_dir, f"fixtures/{name}.py") + ":Predictor"
+from tests.server.conftest import _fixture_path
 
 
 @pytest.fixture
@@ -46,7 +43,7 @@ def runner():
         runner.shutdown()
 
 
-def test_prediction_runner_setup():
+def test_runner_setup():
     runner = Runner(
         runnable_ref=_fixture_path("sleep"), shutdown_event=threading.Event()
     )
@@ -61,12 +58,8 @@ def test_prediction_runner_setup():
         runner.shutdown()
 
 
-REQUEST_TYPES = [(PredictionRequest), (TrainingRequest)]
-
-
-@pytest.mark.parametrize("request_type", REQUEST_TYPES)
-def test_prediction_runner(runner, request_type):
-    request = request_type(input={"sleep": 0.1})
+def test_runner(runner):
+    request = JobRequest(input={"sleep": 0.1})
     _, async_result = runner.run(request)
     response = async_result.get(timeout=1)
     assert response.output == "done in 0.1 seconds"
@@ -77,9 +70,8 @@ def test_prediction_runner(runner, request_type):
     assert isinstance(response.completed_at, datetime)
 
 
-@pytest.mark.parametrize("request_type", REQUEST_TYPES)
-def test_prediction_runner_called_while_busy(runner, request_type):
-    request = request_type(input={"sleep": 0.1})
+def test_runner_called_while_busy(runner):
+    request = JobRequest(input={"sleep": 0.1})
     _, async_result = runner.run(request)
 
     assert runner.is_busy()
@@ -91,8 +83,8 @@ def test_prediction_runner_called_while_busy(runner, request_type):
     async_result.get()
 
 
-def test_prediction_runner_called_while_busy_idempotent(runner):
-    request = PredictionRequest(id="abcd1234", input={"sleep": 0.1})
+def test_runner_called_while_busy_idempotent(runner):
+    request = JobRequest(id="abcd1234", input={"sleep": 0.1})
 
     runner.run(request)
     runner.run(request)
@@ -104,9 +96,9 @@ def test_prediction_runner_called_while_busy_idempotent(runner):
     assert response.status == "succeeded"
 
 
-def test_prediction_runner_called_while_busy_idempotent_wrong_id(runner):
-    request1 = PredictionRequest(id="abcd1234", input={"sleep": 0.1})
-    request2 = PredictionRequest(id="5678efgh", input={"sleep": 0.1})
+def test_runner_called_while_busy_idempotent_wrong_id(runner):
+    request1 = JobRequest(id="abcd1234", input={"sleep": 0.1})
+    request2 = JobRequest(id="5678efgh", input={"sleep": 0.1})
 
     _, async_result = runner.run(request1)
     with pytest.raises(RunnerBusyError):
@@ -118,9 +110,8 @@ def test_prediction_runner_called_while_busy_idempotent_wrong_id(runner):
     assert response.status == "succeeded"
 
 
-@pytest.mark.parametrize("request_type", REQUEST_TYPES)
-def test_prediction_runner_cancel(runner, request_type):
-    request = request_type(input={"sleep": 0.5})
+def test_runner_cancel(runner):
+    request = JobRequest(input={"sleep": 0.5})
     _, async_result = runner.run(request)
 
     runner.cancel()
@@ -134,9 +125,8 @@ def test_prediction_runner_cancel(runner, request_type):
     assert isinstance(response.completed_at, datetime)
 
 
-@pytest.mark.parametrize("request_type", REQUEST_TYPES)
-def test_prediction_runner_cancel_matching_id(runner, request_type):
-    request = request_type(id="abcd1234", input={"sleep": 0.5})
+def test_runner_cancel_matching_id(runner):
+    request = JobRequest(id="abcd1234", input={"sleep": 0.5})
     _, async_result = runner.run(request)
 
     runner.cancel(id="abcd1234")
@@ -146,9 +136,8 @@ def test_prediction_runner_cancel_matching_id(runner, request_type):
     assert response.status == "canceled"
 
 
-@pytest.mark.parametrize("request_type", REQUEST_TYPES)
-def test_prediction_runner_cancel_by_mismatched_id(runner, request_type):
-    request = request_type(id="abcd1234", input={"sleep": 0.5})
+def test_runner_cancel_by_mismatched_id(runner):
+    request = JobRequest(id="abcd1234", input={"sleep": 0.5})
     _, async_result = runner.run(request)
 
     with pytest.raises(UnknownPredictionError):
@@ -159,11 +148,8 @@ def test_prediction_runner_cancel_by_mismatched_id(runner, request_type):
     assert response.status == "succeeded"
 
 
-# List of
-
-
 # list of (events, calls)
-RUNNABLE_TESTS = [
+JOB_TESTS = [
     ([Heartbeat()], []),
     ([Done()], [mock.call.succeeded()]),
     ([Done(canceled=True)], [mock.call.canceled()]),
@@ -209,11 +195,10 @@ def fake_worker(events):
     return FakeWorker()
 
 
-@pytest.mark.parametrize("events,calls", RUNNABLE_TESTS)
-@pytest.mark.parametrize("request_type", REQUEST_TYPES)
-def test_predict(events, calls, request_type):
+@pytest.mark.parametrize("events,calls", JOB_TESTS)
+def test_predict(events, calls):
     worker = fake_worker(events)
-    request = request_type(input={"text": "hello"}, foo="bar")
+    request = PredictionRequest(input={"text": "hello"}, foo="bar")
     event_handler = mock.Mock()
     should_cancel = threading.Event()
 
@@ -227,12 +212,25 @@ def test_predict(events, calls, request_type):
     assert event_handler.method_calls == calls
 
 
-RESPONSE_TYPES = [(PredictionResponse), (TrainingResponse)]
+@pytest.mark.parametrize("events,calls", JOB_TESTS)
+def test_train(events, calls):
+    worker = fake_worker(events)
+    request = TrainingRequest(input={"text": "hello"}, foo="bar")
+    event_handler = mock.Mock()
+    should_cancel = threading.Event()
+
+    response = work(
+        worker=worker,
+        request=request,
+        event_handler=event_handler,
+        should_cancel=should_cancel,
+    )
+
+    assert event_handler.method_calls == calls
 
 
-@pytest.mark.parametrize("response_type", RESPONSE_TYPES)
-def test_prediction_event_handler(response_type):
-    p = response_type(input={"hello": "there"})
+def test_event_handler():
+    p = JobResponse(input={"hello": "there"})
     h = JobEventHandler(p)
 
     assert p.status == Status.PROCESSING
@@ -297,10 +295,13 @@ def test_prediction_event_handler_webhook_sender(match):
     )
 
 
-def test_training_event_handler_webhook_sender_metric_name(match):
+def test_training_event_handler_webhook_sender(match):
+    """
+    Metric name should be 'training_time' rather than 'predict_time'.
+    """
     s = mock.Mock()
     p = TrainingResponse(input={})
-    h = JobEventHandler(p, webhook_sender=s, job_type=JobType.TRAINING)
+    h = JobEventHandler(p, webhook_sender=s)
     s.reset_mock()
     h.succeeded()
 
@@ -316,10 +317,9 @@ def test_training_event_handler_webhook_sender_metric_name(match):
     )
 
 
-@pytest.mark.parametrize("response_type", RESPONSE_TYPES)
-def test_prediction_event_handler_webhook_sender_intermediate(match, response_type):
+def test_event_handler_webhook_sender_intermediate(match):
     s = mock.Mock()
-    p = response_type(input={"hello": "there"})
+    p = JobResponse(input={"hello": "there"})
     h = JobEventHandler(p, webhook_sender=s)
 
     s.assert_called_once_with(match({"status": "processing"}), WebhookEvent.START)
@@ -394,10 +394,9 @@ def test_prediction_event_handler_webhook_sender_intermediate(match, response_ty
     s.assert_called_once_with(match({"status": "canceled"}), WebhookEvent.COMPLETED)
 
 
-@pytest.mark.parametrize("response_type", RESPONSE_TYPES)
-def test_prediction_event_handler_file_uploads(response_type):
+def test_event_handler_file_uploads():
     u = mock.Mock()
-    p = response_type(input={"hello": "there"})
+    p = JobResponse(input={"hello": "there"})
     h = JobEventHandler(p, file_uploader=u)
 
     # in reality this would be a Path object, but in this test we just care it

@@ -31,7 +31,13 @@ from ..predictor import (
     load_runnable_from_ref,
 )
 
-from .runner import JobType, Runner, RunnerBusyError, UnknownPredictionError
+from .runner import (
+    JobType,
+    Runner,
+    RunnerBusyError,
+    UnknownPredictionError,
+    UnknownTrainingError,
+)
 
 
 log = structlog.get_logger("cog.server.http")
@@ -140,29 +146,51 @@ def create_app(
         if runner.is_busy():
             return JSONResponse({"detail": "Already training."}, status_code=409)
 
-        return _train(request=request)
+        respond_async = prefer == "respond-async"
 
-    def _train(*, request: TrainingRequest) -> Response:
+        return _train(request=request, respond_async=respond_async)
+
+    def _train(*, request: TrainingRequest, respond_async: bool) -> Response:
         # [compat] If no body is supplied, assume that this model can be run
         # with empty input. This will throw a ValidationError if that's not
         # possible.
         if request is None:
-            request = TrainingResponse(input={})
+            request = TrainingRequest(input={})
         # [compat] If body is supplied but input is None, set it to an empty
         # dictionary so that later code can be simpler.
         if request.input is None:
             request.input = {}
 
         try:
-            initial_response, _ = runner.run(request, upload=True)
+            # For now, we only ask the Runner to handle file uploads for
+            # async predictions. This is unfortunate but required to ensure
+            # backwards-compatible behaviour for synchronous predictions.
+            initial_response, async_result = runner.run(request, upload=respond_async)
         except RunnerBusyError:
             return JSONResponse(
-                {"detail": "Already running a training"}, status_code=409
+                {"detail": "Already running training."}, status_code=409
             )
 
-        return JSONResponse(jsonable_encoder(initial_response), status_code=202)
+        if respond_async:
+            return JSONResponse(jsonable_encoder(initial_response), status_code=202)
 
-    @app.post("/trainings/{training}/cancel")
+        try:
+            response = TrainingResponse(**async_result.get().dict())
+        except ValidationError as e:
+            _log_invalid_output(e)
+            raise HTTPException(status_code=500)
+
+        response_object = response.dict()
+        response_object["output"] = upload_files(
+            response_object["output"],
+            upload_file=lambda fh: upload_file(fh, request.output_file_prefix),  # type: ignore
+        )
+
+        # FIXME: clean up output files
+        encoded_response = jsonable_encoder(response_object)
+        return JSONResponse(content=encoded_response)
+
+    @app.post("/trainings/{training_id}/cancel")
     def cancel_training(training_id: str = Path(..., title="Training ID")) -> Any:
         """
         Cancel a running training.
@@ -176,7 +204,7 @@ def create_app(
             return JSONResponse({}, status_code=404)
         try:
             runner.cancel(training_id, JobType.TRAINING)
-        except UnknownPredictionError:
+        except UnknownTrainingError:
             return JSONResponse({}, status_code=404)
         else:
             return JSONResponse({}, status_code=200)

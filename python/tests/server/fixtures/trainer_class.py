@@ -1,10 +1,6 @@
-from pydantic import BaseModel
-
-
-class Output(BaseModel):
-    number: int
-
-
 class Trainer:
-    def train() -> Output:
-        return 42
+    def setup(self) -> None:
+        self.num = 42
+
+    def train(self) -> int:
+        return self.num
