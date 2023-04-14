@@ -436,6 +436,15 @@ if __name__ == "__main__":
         default=False,
         help="Ignore SIGTERM and wait for a request to /shutdown (or a SIGINT) before exiting",
     )
+    parser.add_argument(
+        "--x-mode",
+        dest="mode",
+        type=str,
+        default="predict",
+        choices=["predict", "train"],
+        help="Experimental: Run in 'predict' or 'train' mode",
+    )
+
     args = parser.parse_args()
 
     # log level is configurable so we can make it quiet or verbose for `cog predict`
@@ -460,6 +469,7 @@ if __name__ == "__main__":
         shutdown_event=shutdown_event,
         threads=threads,
         upload_url=args.upload_url,
+        mode=args.mode,
     )
 
     port = int(os.getenv("PORT", 5000))
