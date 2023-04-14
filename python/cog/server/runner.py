@@ -52,7 +52,7 @@ class Runner(ABC):
     def __init__(
         self,
         *,
-        job_ref: str,
+        runnable_ref: str,
         shutdown_event: threading.Event,
         upload_url: Optional[str] = None,
     ):
@@ -62,7 +62,7 @@ class Runner(ABC):
         self._response: Optional[schema.JobResponse] = None
         self._result: Optional[AsyncResult] = None
 
-        self._worker = Worker(job_ref=job_ref)
+        self._worker = Worker(job_ref=runnable_ref)
         self._should_cancel = threading.Event()
 
         self._shutdown_event = shutdown_event
@@ -180,8 +180,10 @@ def create_event_handler(
 ) -> "JobEventHandler":
     if isinstance(request, schema.PredictionRequest):
         response = schema.PredictionResponse(**request.dict())
+        job_type = JobType.PREDICTION
     else:
-        response = schema.TrainingResponse(**response.dict())
+        response = schema.TrainingResponse(**request.dict())
+        job_type = JobType.TRAINING
 
     webhook = request.webhook
     events_filter = (
@@ -198,6 +200,7 @@ def create_event_handler(
 
     event_handler = JobEventHandler(
         response,
+        job_type=job_type,
         webhook_sender=webhook_sender,
         file_uploader=file_uploader,
     )
@@ -221,17 +224,18 @@ class JobEventHandler:
     def __init__(
         self,
         response: schema.JobResponse,
+        job_type: JobType = JobType.PREDICTION,
         webhook_sender: Optional[Callable] = None,
         file_uploader: Optional[Callable] = None,
     ):
-        if isinstance(response, schema.PredictionResponse):
-            self._runnable_name = "prediction"
-            self._runnable_class_name = "Predictor"
-            self._time_metric_name = "predict_time"
-        else:
+        if job_type == JobType.TRAINING:
             self._runnable_name = "training"
             self._runnable_class_name = "Trainer"
             self._time_metric_name = "training_time"
+        else:
+            self._runnable_name = "prediction"
+            self._runnable_class_name = "Predictor"
+            self._time_metric_name = "predict_time"
 
         log.info(f"starting {self._runnable_name}")
 

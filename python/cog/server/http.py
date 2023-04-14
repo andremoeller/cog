@@ -20,7 +20,6 @@ from pydantic import ValidationError
 from pydantic.error_wrappers import ErrorWrapper
 
 from .. import schema
-from ..errors import TrainerNotSet
 from ..files import upload_file
 from ..json import upload_files
 from ..logging import setup_logging
@@ -63,21 +62,31 @@ def create_app(
     app.state.setup_result = None
     app.state.setup_result_payload = None
 
+    # The Cog application should run either in training mode, or predicting mode, but not both.
+    # This is to avoid running setup for a predictor, which generally loads a model,
+    # and training in the same container without unloading the model.
     runnable_ref = get_runnable_ref(config, mode)
+    job_type = JobType.TRAINING if mode == "train" else JobType.PREDICTION
 
     runner = Runner(
-        predictor_ref=runnable_ref,
+        runnable_ref=runnable_ref,
         shutdown_event=shutdown_event,
         upload_url=upload_url,
     )
-    # TODO: avoid loading predictor code in this process
-    predictor = load_runnable_from_ref(runnable_ref)
 
-    InputType = get_input_type(predictor)
-    OutputType = get_output_type(predictor)
+    # TODO: avoid loading predictor code in this process
+    runnable = load_runnable_from_ref(runnable_ref)
+
+    InputType = get_input_type(runnable)
+    OutputType = get_output_type(runnable)
 
     PredictionRequest = schema.PredictionRequest.with_types(input_type=InputType)
     PredictionResponse = schema.PredictionResponse.with_types(
+        input_type=InputType, output_type=OutputType
+    )
+
+    TrainingRequest = schema.TrainingRequest.with_types(input_type=InputType)
+    TrainingResponse = schema.TrainingResponse.with_types(
         input_type=InputType, output_type=OutputType
     )
 
@@ -110,7 +119,7 @@ def create_app(
         return jsonable_encoder(
             {
                 "status": health.name,
-                "setup": app.state.predictor_setup_result_payload,
+                "setup": app.state.setup_result_payload,
             }
         )
 
@@ -123,11 +132,12 @@ def create_app(
         """
         Run a training on the model
         """
-        if not trainer_runner:
+        if job_type != JobType.TRAINING:
             return JSONResponse(
-                {"detail": "Trainer is not implemented in cog.yaml"}, status_code=501
+                {"detail": "The application is running as a predictor, not a trainer."},
+                status_code=400,
             )
-        if trainer_runner.is_busy():
+        if runner.is_busy():
             return JSONResponse({"detail": "Already training."}, status_code=409)
 
         return _train(request=request)
@@ -144,10 +154,10 @@ def create_app(
             request.input = {}
 
         try:
-            initial_response, async_result = runner.run(request, upload=True)
+            initial_response, _ = runner.run(request, upload=True)
         except RunnerBusyError:
             return JSONResponse(
-                {"detail": "Already running a prediction"}, status_code=409
+                {"detail": "Already running a training"}, status_code=409
             )
 
         return JSONResponse(jsonable_encoder(initial_response), status_code=202)
@@ -157,14 +167,15 @@ def create_app(
         """
         Cancel a running training.
         """
-        if not trainer_runner:
+        if job_type != JobType.TRAINING:
             return JSONResponse(
-                {"detail": "Trainer is not implemented in cog.yaml"}, status_code=501
+                {"detail": "The application is running as a predictor, not a trainer."},
+                status_code=400,
             )
-        if not trainer_runner.is_busy():
+        if not runner.is_busy():
             return JSONResponse({}, status_code=404)
         try:
-            trainer_runner.cancel(training_id, JobType.TRAINING)
+            runner.cancel(training_id, JobType.TRAINING)
         except UnknownPredictionError:
             return JSONResponse({}, status_code=404)
         else:
@@ -179,6 +190,11 @@ def create_app(
         """
         Run a single prediction on the model
         """
+        if job_type != JobType.PREDICTION:
+            return JSONResponse(
+                {"detail": "The application is running as a trainer, not a predictor."},
+                status_code=400,
+            )
         if runner.is_busy():
             return JSONResponse(
                 {"detail": "Already running a prediction"}, status_code=409
@@ -202,6 +218,11 @@ def create_app(
         """
         Run a single prediction on the model (idempotent creation).
         """
+        if job_type != JobType.PREDICTION:
+            return JSONResponse(
+                {"detail": "The application is running as a trainer, not a predictor."},
+                status_code=400,
+            )
         if request.id is not None and request.id != prediction_id:
             raise RequestValidationError(
                 [
@@ -270,6 +291,11 @@ def create_app(
         """
         Cancel a running prediction
         """
+        if job_type != JobType.PREDICTION:
+            return JSONResponse(
+                {"detail": "The application is running as a trainer, not a predictor."},
+                status_code=400,
+            )
         if not runner.is_busy():
             return JSONResponse({}, status_code=404)
         try:
@@ -300,7 +326,7 @@ def create_app(
         else:
             app.state.health = Health.SETUP_FAILED
 
-        app.state.predictor_setup_result_payload = result
+        app.state.setup_result_payload = result
 
         # Reset app.state.setup_result so future calls are a no-op
         app.state.predictor_setup_result = None
